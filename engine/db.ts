@@ -56,6 +56,11 @@ export function createDatabase(dbPath = "./prism.db"): Database {
   fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
   const db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL;");
+  // Wait up to 5s for a contended lock instead of throwing SQLITE_BUSY
+  // immediately. The agent shares prism.db with ad-hoc readers (CLI
+  // `portfolio`, snapshot inspectors); without this, a concurrent open
+  // could surface a transient error that crashed the scan loop.
+  db.exec("PRAGMA busy_timeout = 5000;");
   loadVec(db);
   runMigrations(db);
   return db;

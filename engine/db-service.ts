@@ -5,7 +5,10 @@ import { getEmbedding } from "./embeddings.js";
 import type { MemoryEntry, MemoryCategory, PoolSnapshot, Position, BinArray } from "./types.js";
 import { DbService, type DbApi } from "./services.js";
 import { bigintReplacer } from "./bigint-json.js";
+import { createLogger } from "./logger.js";
 import { randomUUID } from "crypto";
+
+const log = createLogger("db-service");
 
 export interface PositionRecord {
   poolAddress: string;
@@ -43,16 +46,48 @@ export interface AuditRecord {
   error: string | null;
 }
 
+// All DB access funnels through these three helpers. bun:sqlite can throw a
+// transient SQLITE_BUSY / "database is locked" when prism.db is opened
+// concurrently (the agent shares it with the CLI `portfolio` command and
+// ad-hoc inspectors). PRAGMA busy_timeout handles most contention, but a
+// short synchronous retry covers the residual cases so a transient lock can
+// never bubble up and crash the scan loop. Non-lock errors rethrow at once.
+function isTransientLockError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /lock|busy/i.test(msg);
+}
+
+function withBusyRetry<T>(fn: () => T): T {
+  const maxAttempts = 5;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      if (attempt >= maxAttempts || !isTransientLockError(err)) throw err;
+      // Brief synchronous spin-wait; busy_timeout already absorbed the wait,
+      // this just re-attempts the prepared statement a few times.
+      const until = Date.now() + attempt * 20;
+      while (Date.now() < until) {
+        /* spin */
+      }
+    }
+  }
+}
+
 function queryOne<T>(db: Database, sql: string, ...params: unknown[]): T | null {
-  return (db.query(sql) as unknown as { get(...p: unknown[]): T | null }).get(...params);
+  return withBusyRetry(() =>
+    (db.query(sql) as unknown as { get(...p: unknown[]): T | null }).get(...params),
+  );
 }
 
 function queryAll<T>(db: Database, sql: string, ...params: unknown[]): T[] {
-  return (db.query(sql) as unknown as { all(...p: unknown[]): T[] }).all(...params);
+  return withBusyRetry(() =>
+    (db.query(sql) as unknown as { all(...p: unknown[]): T[] }).all(...params),
+  );
 }
 
 function runOne(db: Database, sql: string, ...params: unknown[]): void {
-  (db.run as (sql: string, ...params: unknown[]) => void)(sql, ...params);
+  withBusyRetry(() => (db.run as (sql: string, ...params: unknown[]) => void)(sql, ...params));
 }
 
 function serializeJson(value: unknown): string | null {
@@ -86,6 +121,23 @@ export const DbLive = (dbPath?: string) =>
     DbService,
     Effect.gen(function* () {
       const db = createDatabase(dbPath);
+
+      // The vec_memory virtual table only exists when the sqlite-vec extension
+      // loaded successfully (it can't on Bun's bundled SQLite without a system
+      // libsqlite3 with loadable-extension support — e.g. some Linux/WSL
+      // setups). When it's absent, querying it throws "no such table" and used
+      // to crash the scan loop. Detect it once here and degrade memory to a
+      // no-op rather than taking the whole agent down — memory is advisory.
+      const vecMemoryAvailable =
+        queryOne<{ n: number }>(
+          db,
+          "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name='vec_memory'",
+        )?.n === 1;
+      if (!vecMemoryAvailable) {
+        log.warn(
+          "vec_memory table absent (sqlite-vec not loaded); memory recall/storage disabled for this run",
+        );
+      }
 
       const api: DbApi = {
         db,
@@ -262,6 +314,7 @@ export const DbLive = (dbPath?: string) =>
 
         insertMemory: (entry) =>
           Effect.tryPromise(async () => {
+            if (!vecMemoryAvailable) return; // memory disabled (no sqlite-vec)
             const id = randomUUID();
             const now = Date.now();
             const expiresAt = now + ttlMs(entry.category);
@@ -285,6 +338,7 @@ export const DbLive = (dbPath?: string) =>
 
         queryMemory: (queryText, topK, poolAddress) =>
           Effect.tryPromise(async () => {
+            if (!vecMemoryAvailable) return []; // memory disabled (no sqlite-vec)
             const now = Date.now();
             const embedding = await getEmbedding(queryText);
             const sql = poolAddress
@@ -336,6 +390,7 @@ export const DbLive = (dbPath?: string) =>
 
         pruneMemory: () =>
           Effect.sync(() => {
+            if (!vecMemoryAvailable) return 0; // memory disabled (no sqlite-vec)
             const now = Date.now();
             // sqlite-vec doesn't support DELETE with WHERE on virtual tables directly in all versions,
             // so we find expired IDs and delete them
