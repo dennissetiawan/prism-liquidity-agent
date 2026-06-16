@@ -4,7 +4,9 @@
  * SQLite table for the replay backtest.
  *
  * Data sources:
- *   - GeckoTerminal OHLCV (hourly, 1000 candles = ~41 days back)
+ *   - GeckoTerminal OHLCV — 1000 candles/page; --pages walks backward via
+ *     before_timestamp to a pool's inception. Hourly ≈ 41 days/page; daily ≈
+ *     2.7 years/page. History is ultimately bounded by pool age, not the API.
  *   - Solana RPC + @meteora-ag/dlmm SDK for bin_step + reference active bin
  *
  * What it produces per candle:
@@ -21,9 +23,12 @@
  *   - binArray      : synthetic 41 bins (same as live engine)
  *
  * Usage:
- *   bun run ops/fetch-history.ts                          # 5 default pools
+ *   bun run ops/fetch-history.ts                          # 5 default pools, 1 hourly page
  *   bun run ops/fetch-history.ts --pools <addr1,addr2>    # custom pool set
  *   bun run ops/fetch-history.ts --db ./prism.db --clean  # wipe first
+ *   bun run ops/fetch-history.ts --pages 6                # ~6 hourly pages → to inception
+ *   bun run ops/fetch-history.ts --timeframe day          # daily candles (long, coarse)
+ *   bun run ops/fetch-history.ts --aggregate 4            # 4h candles (~166 days/page)
  */
 import { Duration, Effect } from "effect";
 import { Connection, PublicKey } from "@solana/web3.js";
@@ -73,10 +78,20 @@ interface CliArgs {
   pools: ReadonlyArray<string>;
   dbPath: string;
   clean: boolean;
+  timeframe: "hour" | "day";
+  aggregate: number;
+  pages: number;
 }
 
 function parseArgs(argv: ReadonlyArray<string>): CliArgs {
-  const out: CliArgs = { pools: DEFAULT_POOLS, dbPath: "./prism.db", clean: false };
+  const out: CliArgs = {
+    pools: DEFAULT_POOLS,
+    dbPath: "./prism.db",
+    clean: false,
+    timeframe: "hour",
+    aggregate: 1,
+    pages: 1,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = argv[i + 1];
@@ -91,6 +106,26 @@ function parseArgs(argv: ReadonlyArray<string>): CliArgs {
       i++;
     } else if (a === "--clean") {
       out.clean = true;
+    } else if (a === "--timeframe" && (next === "hour" || next === "day")) {
+      out.timeframe = next;
+      i++;
+    } else if (a === "--aggregate" && next) {
+      const parsed = Number(next);
+      if (Number.isNaN(parsed) || parsed < 1) {
+        throw new Error(`Invalid --aggregate value: ${next}. Must be a positive integer.`);
+      }
+      out.aggregate = Math.floor(parsed);
+      i++;
+    } else if (a === "--pages" && next) {
+      // Each page is up to OHLCV_LIMIT candles, walked backward via
+      // before_timestamp. Fetching stops early once a pool's inception is
+      // reached (a short page), so over-specifying --pages is harmless.
+      const parsed = Number(next);
+      if (Number.isNaN(parsed) || parsed < 1) {
+        throw new Error(`Invalid --pages value: ${next}. Must be a positive integer.`);
+      }
+      out.pages = Math.floor(parsed);
+      i++;
     }
   }
   return out;
@@ -134,30 +169,76 @@ function fetchPoolMeta(address: string, connection: Connection): Effect.Effect<P
   });
 }
 
-function fetchOhlcv(address: string): Effect.Effect<OhlcvCandle[], Error> {
+interface OhlcvOpts {
+  readonly timeframe: "hour" | "day";
+  readonly aggregate: number;
+  readonly pages: number;
+}
+
+function fetchOhlcv(address: string, opts: OhlcvOpts): Effect.Effect<OhlcvCandle[], Error> {
   return Effect.tryPromise({
     try: async () => {
-      let res = await fetch(
-        `${GECKO_BASE}/networks/solana/pools/${address}/ohlcv/hour?aggregate=1&limit=${OHLCV_LIMIT}&currency=usd`,
-      );
-      for (let attempt = 0; attempt < 3 && res.status === 429; attempt++) {
-        await new Promise((r) => setTimeout(r, RATE_LIMIT_MS * (attempt + 2)));
-        res = await fetch(
-          `${GECKO_BASE}/networks/solana/pools/${address}/ohlcv/hour?aggregate=1&limit=${OHLCV_LIMIT}&currency=usd`,
-        );
+      // GeckoTerminal returns at most OHLCV_LIMIT candles newest-first per
+      // call. To reach further back than one page we walk backward with
+      // before_timestamp = the oldest candle seen so far, accumulating pages
+      // until we've fetched opts.pages or hit the pool's inception (a page
+      // shorter than the limit). Result stays globally newest-first.
+      const all: OhlcvCandle[] = [];
+      let beforeTs: number | undefined;
+      for (let page = 0; page < opts.pages; page++) {
+        try {
+          const params = new URLSearchParams({
+            aggregate: String(opts.aggregate),
+            limit: String(OHLCV_LIMIT),
+            currency: "usd",
+          });
+          if (beforeTs !== undefined) params.set("before_timestamp", String(beforeTs));
+          const url = `${GECKO_BASE}/networks/solana/pools/${address}/ohlcv/${opts.timeframe}?${params}`;
+
+          let res = await fetch(url);
+          for (let attempt = 0; attempt < 3 && res.status === 429; attempt++) {
+            await new Promise((r) => setTimeout(r, RATE_LIMIT_MS * (attempt + 2)));
+            res = await fetch(url);
+          }
+          if (!res.ok) {
+            throw new Error(`GeckoTerminal OHLCV ${address}: HTTP ${res.status}`);
+          }
+          const json = (await res.json()) as {
+            data?: { attributes?: { ohlcv_list?: number[][] } };
+          };
+          const raw = json.data?.attributes?.ohlcv_list ?? [];
+          if (raw.length === 0) break;
+          for (const c of raw) {
+            all.push({ timestamp: c[0]! * 1000, close: c[4]!, volume: c[5] ?? 0 });
+          }
+
+          const oldestSec = raw[raw.length - 1]![0]!;
+          // Guard against a non-advancing cursor (would loop forever).
+          if (beforeTs !== undefined && oldestSec >= beforeTs) break;
+          beforeTs = oldestSec;
+          // A short page means we've reached the pool's earliest data.
+          if (raw.length < OHLCV_LIMIT) break;
+          // Be polite to the rate limiter between pages (not after the last one).
+          if (page < opts.pages - 1) {
+            await new Promise((r) => setTimeout(r, RATE_LIMIT_MS));
+          }
+        } catch (e) {
+          // Deep before_timestamp paging is flaky on GeckoTerminal's free tier
+          // (intermittent 401/429). If earlier pages already succeeded, keep
+          // that partial history rather than discarding everything; only a
+          // first-page failure is a genuine error worth surfacing.
+          if (all.length > 0) {
+            log.warn(
+              `  [${address.slice(0, 8)}…] pagination stopped at page ${page + 1}: ` +
+                `${e instanceof Error ? e.message.split("\n")[0] : String(e)} ` +
+                `(keeping ${all.length} candles fetched so far)`,
+            );
+            break;
+          }
+          throw e;
+        }
       }
-      if (!res.ok) {
-        throw new Error(`GeckoTerminal OHLCV ${address}: HTTP ${res.status}`);
-      }
-      const json = (await res.json()) as {
-        data?: { attributes?: { ohlcv_list?: number[][] } };
-      };
-      const raw = json.data?.attributes?.ohlcv_list ?? [];
-      return raw.map((c) => ({
-        timestamp: c[0]! * 1000,
-        close: c[4]!,
-        volume: c[5] ?? 0,
-      }));
+      return all;
     },
     catch: (e) => (e instanceof Error ? e : new Error(String(e))),
   });
@@ -191,9 +272,17 @@ function buildBinArray(activeBinId: number, currentPrice: number, binStep: numbe
   return { lowerBinId, upperBinId, bins, activeBinId, binStep };
 }
 
-function rollingVolume24h(candles: ReadonlyArray<OhlcvCandle>, index: number): number {
+// Sum the trailing 24h of volume. `windowCandles` is how many candles span
+// 24h for the chosen timeframe: 24 for hourly (aggregate=1), 6 for 4h, 1 for
+// daily. Candles are newest-first, so index..index+window-1 is the trailing
+// window ending at `index`.
+function rollingVolume24h(
+  candles: ReadonlyArray<OhlcvCandle>,
+  index: number,
+  windowCandles: number,
+): number {
   let sum = 0;
-  const end = Math.min(candles.length, index + 24);
+  const end = Math.min(candles.length, index + windowCandles);
   for (let j = index; j < end; j++) {
     sum += candles[j]!.volume;
   }
@@ -251,8 +340,15 @@ const program = Effect.gen(function* () {
       );
 
       yield* Effect.sleep(Duration.millis(RATE_LIMIT_MS));
-      log.info(`[${short}] fetching hourly OHLCV (max ${OHLCV_LIMIT} candles)…`);
-      const candles = yield* fetchOhlcv(addr);
+      log.info(
+        `[${short}] fetching ${args.aggregate > 1 ? args.aggregate : ""}${args.timeframe} OHLCV ` +
+          `(up to ${args.pages} page(s) × ${OHLCV_LIMIT})…`,
+      );
+      const candles = yield* fetchOhlcv(addr, {
+        timeframe: args.timeframe,
+        aggregate: args.aggregate,
+        pages: args.pages,
+      });
       if (candles.length === 0) {
         log.warn(`  no OHLCV data, skipping`);
         skipped.push(addr);
@@ -262,10 +358,14 @@ const program = Effect.gen(function* () {
       const last = new Date(candles[0]!.timestamp).toISOString().slice(0, 10);
       log.info(`  ${candles.length} candles: ${first} → ${last}`);
 
+      // How many candles cover a trailing 24h for this timeframe/aggregate.
+      const windowCandles =
+        args.timeframe === "day" ? 1 : Math.max(1, Math.round(24 / args.aggregate));
+
       let saved = 0;
       for (let i = 0; i < candles.length; i++) {
         const candle = candles[i]!;
-        const volume24hUsd = rollingVolume24h(candles, i);
+        const volume24hUsd = rollingVolume24h(candles, i, windowCandles);
         const snap = buildSnapshot(meta, candle, volume24hUsd);
         yield* db.saveSnapshot(snap);
         saved++;
