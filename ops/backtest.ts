@@ -30,10 +30,20 @@ interface CliArgs {
   dbPath: string;
 }
 
+// Mirrors DEFAULT_POOLS in ops/fetch-history.ts so `--source replay` works
+// out of the box after a fetch: 5 valid Meteora DLMM pools, bin steps 4/10/20/80.
+const DEFAULT_POOLS = [
+  "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6", // SOL/USDC   binStep=4
+  "3C5YE97HADPDxZehYq9Cis8AXr9aNyrUsczKzE1nDbW9", // TRUMP/USDC binStep=10
+  "ANCx141SujgVdbKz9NTEH8F38qWsnyyXsVju64aU3qLB", // HYPE/USDC  binStep=20
+  "C8Gr6AUuq9hEdSYJzoEpNcdjpojPZwqG5MtQbeouNNwg", // JUP/SOL    binStep=80
+  "7ubS3GccjhQY99AYNKXjNJqnXjaokEdfdV915xnCb96r", // cbBTC/USDC binStep=4
+];
+
 function parseArgs(argv: ReadonlyArray<string>): CliArgs {
   const out: CliArgs = {
     days: 7,
-    pools: ["5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6"],
+    pools: DEFAULT_POOLS,
     source: "synthetic",
     dbPath: "./prism.db",
   };
