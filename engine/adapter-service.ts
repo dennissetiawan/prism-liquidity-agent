@@ -355,13 +355,16 @@ export const AdapterLive = Layer.effect(
 
     // ─── Price fetching ────────────────────────────────────────────────────
 
+    // Last-resort prices for when the live price APIs are unreachable. List
+    // ONLY tokens genuinely pegged near $1 — fallbacks are checked before the
+    // API, so any volatile token here (SOL, JUP, jitoSOL previously) would
+    // short-circuit the live lookup and be pinned to a stale/wrong value
+    // (SOL $165 vs ~$75, JUP $1.00 vs ~$0.20), badly inflating TVL. Volatile
+    // tokens must always resolve through the price API.
     const fallbackPrices: Record<string, number> = {
-      [SOL_MINT]: 165,
       [USDC_MINT]: 1.0,
-      Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: 1.0,
-      "7i5KKsX2weiTkry7jA4ZwSu2SmtUa4rCCi4t8U9b3bR2": 1.0,
-      J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYk6U5Yf9sW: 1.0,
-      JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN: 1.0,
+      Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: 1.0, // USDT
+      "7i5KKsX2weiTkry7jA4ZwSu2SmtUa4rCCi4t8U9b3bR2": 1.0, // stablecoin
     };
 
     function fetchTokenPrices(
@@ -381,19 +384,23 @@ export const AdapterLive = Layer.effect(
 
         if (missing.length === 0) return prices;
 
-        // Try Jupiter Price API
+        // Try Jupiter Price API v3 (lite endpoint). The old price.jup.ag/v6
+        // host was retired and now fails to connect, which silently forced
+        // every non-fallback token onto rate-limited CoinGecko (→ price 0 →
+        // $0 TVL). v3 returns a flat map: { "<mint>": { usdPrice: number } }.
         try {
           const ids = missing.join(",");
           const res = yield* Effect.tryPromise(() =>
-            fetch(`https://price.jup.ag/v6/price?ids=${ids}`),
+            fetch(`https://lite-api.jup.ag/price/v3?ids=${ids}`),
           );
           if (res.ok) {
-            const json = (yield* Effect.tryPromise(() => res.json())) as {
-              data?: Record<string, { price: number }>;
-            };
+            const json = (yield* Effect.tryPromise(() => res.json())) as Record<
+              string,
+              { usdPrice?: number }
+            >;
             const stillMissing: string[] = [];
             for (const mint of missing) {
-              const price = json.data?.[mint]?.price;
+              const price = json[mint]?.usdPrice;
               if (price != null) {
                 prices[mint] = price;
               } else {
@@ -465,34 +472,18 @@ export const AdapterLive = Layer.effect(
           (mintYInfo.value?.data as { parsed?: { info?: { decimals?: number } } })?.parsed?.info
             ?.decimals ?? 6;
 
-        const vaultX = yield* Effect.tryPromise(() =>
-          connection.getTokenAccountsByOwner(pubkey, {
-            mint: lbPair.tokenXMint,
-          }),
-        );
-        const vaultY = yield* Effect.tryPromise(() =>
-          connection.getTokenAccountsByOwner(pubkey, {
-            mint: lbPair.tokenYMint,
-          }),
-        );
-
-        let reserveX = 0;
-        let reserveY = 0;
-
-        if (vaultX.value.length > 0 && vaultX.value[0]) {
-          const firstVault = vaultX.value[0] as { pubkey: PublicKey };
-          const bal = yield* Effect.tryPromise(() =>
-            connection.getTokenAccountBalance(firstVault.pubkey),
-          );
-          reserveX = Number(bal.value.amount) / Math.pow(10, tokenXDecimals);
-        }
-        if (vaultY.value.length > 0 && vaultY.value[0]) {
-          const firstVault = vaultY.value[0] as { pubkey: PublicKey };
-          const bal = yield* Effect.tryPromise(() =>
-            connection.getTokenAccountBalance(firstVault.pubkey),
-          );
-          reserveY = Number(bal.value.amount) / Math.pow(10, tokenYDecimals);
-        }
+        // Read the canonical reserve vaults the SDK exposes directly
+        // (lbPair.reserveX/reserveY) instead of re-discovering them via
+        // getTokenAccountsByOwner and blindly taking value[0]. Pools can own
+        // more than one token account per mint, so value[0] could read the
+        // wrong (often empty) account → understated or $0 reserves. Reading
+        // the SDK's reserve pubkeys is both correct and 2 fewer RPC calls.
+        const [balX, balY] = yield* Effect.all([
+          Effect.tryPromise(() => connection.getTokenAccountBalance(lbPair.reserveX)),
+          Effect.tryPromise(() => connection.getTokenAccountBalance(lbPair.reserveY)),
+        ]);
+        const reserveX = Number(balX.value.amount) / Math.pow(10, tokenXDecimals);
+        const reserveY = Number(balY.value.amount) / Math.pow(10, tokenYDecimals);
 
         const prices = yield* fetchTokenPrices([tokenXMint, tokenYMint]);
         const priceX = prices[tokenXMint] || 0;
@@ -508,9 +499,17 @@ export const AdapterLive = Layer.effect(
 
         return { tvlUsd, volume24hUsd: estimatedVolume24h, fees24hUsd, apr };
       }).pipe(
-        Effect.catchAll(() =>
-          Effect.succeed({ tvlUsd: 0, volume24hUsd: 0, fees24hUsd: 0, apr: 0 }),
-        ),
+        Effect.catchAll((err) => {
+          // Never silently zero a pool: a transient RPC/price error used to
+          // collapse the whole pool to $0 TVL with no trace, producing junk
+          // snapshots and false pre-filter rejections. Log which pool failed
+          // so the gap is diagnosable; callers still get a safe zeroed result.
+          logger.warn("fetchPoolStats failed; returning zeroed stats", {
+            pool: poolAddress,
+            err: err instanceof Error ? err.message : String(err),
+          });
+          return Effect.succeed({ tvlUsd: 0, volume24hUsd: 0, fees24hUsd: 0, apr: 0 });
+        }),
       );
     }
 
