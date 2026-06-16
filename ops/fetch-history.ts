@@ -35,15 +35,17 @@ import type { BinArray, BinData, PoolSnapshot } from "../engine/types.js";
 
 const log = createLogger("FetchHistory");
 
-// Top 5 SOL/USDC pools on Meteora DLMM by TVL (GeckoTerminal, 2026-06-04).
-// Each pool has a different bin_step → different range widths → exercises
-// the strategy's bin_step-aware range logic.
+// High-volume Meteora DLMM pools (GeckoTerminal, validated 2026-06-16).
+// Span distinct bin_steps (4/10/20/80) → different range widths → exercises
+// the strategy's bin_step-aware range logic. Pools migrate over time; any
+// address that no longer resolves to a DLMM LbPair is skipped at runtime
+// (see the per-pool catchAll below) rather than aborting the whole run.
 const DEFAULT_POOLS = [
-  "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE", // ~$23M TVL
-  "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv", // ~$4.7M TVL
-  "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6", // ~$2.8M TVL
-  "DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ", // ~$1.9M TVL
-  "FksffEqnBRixYGR791Qw2MgdU7zNCpHVFYBL4Fa4qVuH", // ~$889K TVL
+  "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6", // SOL/USDC  binStep=4  ~$3.4M TVL
+  "3C5YE97HADPDxZehYq9Cis8AXr9aNyrUsczKzE1nDbW9", // TRUMP/USDC binStep=10 ~$4.1M TVL
+  "ANCx141SujgVdbKz9NTEH8F38qWsnyyXsVju64aU3qLB", // HYPE/USDC binStep=20 ~$5.4M TVL
+  "C8Gr6AUuq9hEdSYJzoEpNcdjpojPZwqG5MtQbeouNNwg", // JUP/SOL   binStep=80 ~$1.1M TVL
+  "7ubS3GccjhQY99AYNKXjNJqnXjaokEdfdV915xnCb96r", // cbBTC/USDC binStep=4 ~$1.2M TVL
 ];
 
 const SOLANA_RPC = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
@@ -236,34 +238,50 @@ const program = Effect.gen(function* () {
     yield* db.pruneSnapshots(Number.MAX_SAFE_INTEGER);
   }
 
+  const skipped: string[] = [];
   for (const addr of args.pools) {
     const short = `${addr.slice(0, 8)}…${addr.slice(-4)}`;
-    log.info(`[${short}] fetching meta from Solana RPC + GeckoTerminal…`);
-    const meta = yield* fetchPoolMeta(addr, connection);
-    log.info(
-      `  binStep=${meta.binStep} refBin=${meta.refActiveBinId} refPrice=$${meta.refPrice.toFixed(4)} TVL=$${meta.tvlUsd.toFixed(0)} ${meta.tokenXSymbol}/${meta.tokenYSymbol}`,
+    // Isolate each pool: a stale/invalid LbPair, an RPC hiccup, or a
+    // GeckoTerminal error must skip that pool, not abort the whole fetch.
+    yield* Effect.gen(function* () {
+      log.info(`[${short}] fetching meta from Solana RPC + GeckoTerminal…`);
+      const meta = yield* fetchPoolMeta(addr, connection);
+      log.info(
+        `  binStep=${meta.binStep} refBin=${meta.refActiveBinId} refPrice=$${meta.refPrice.toFixed(4)} TVL=$${meta.tvlUsd.toFixed(0)} ${meta.tokenXSymbol}/${meta.tokenYSymbol}`,
+      );
+
+      yield* Effect.sleep(Duration.millis(RATE_LIMIT_MS));
+      log.info(`[${short}] fetching hourly OHLCV (max ${OHLCV_LIMIT} candles)…`);
+      const candles = yield* fetchOhlcv(addr);
+      if (candles.length === 0) {
+        log.warn(`  no OHLCV data, skipping`);
+        skipped.push(addr);
+        return;
+      }
+      const first = new Date(candles[candles.length - 1]!.timestamp).toISOString().slice(0, 10);
+      const last = new Date(candles[0]!.timestamp).toISOString().slice(0, 10);
+      log.info(`  ${candles.length} candles: ${first} → ${last}`);
+
+      let saved = 0;
+      for (let i = 0; i < candles.length; i++) {
+        const candle = candles[i]!;
+        const volume24hUsd = rollingVolume24h(candles, i);
+        const snap = buildSnapshot(meta, candle, volume24hUsd);
+        yield* db.saveSnapshot(snap);
+        saved++;
+      }
+      log.info(`[${short}] saved ${saved} snapshots`);
+    }).pipe(
+      Effect.catchAll((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`[${short}] skipped: ${msg.split("\n")[0]}`);
+        skipped.push(addr);
+        return Effect.void;
+      }),
     );
-
-    yield* Effect.sleep(Duration.millis(RATE_LIMIT_MS));
-    log.info(`[${short}] fetching hourly OHLCV (max ${OHLCV_LIMIT} candles)…`);
-    const candles = yield* fetchOhlcv(addr);
-    if (candles.length === 0) {
-      log.warn(`  no OHLCV data, skipping`);
-      continue;
-    }
-    const first = new Date(candles[candles.length - 1]!.timestamp).toISOString().slice(0, 10);
-    const last = new Date(candles[0]!.timestamp).toISOString().slice(0, 10);
-    log.info(`  ${candles.length} candles: ${first} → ${last}`);
-
-    let saved = 0;
-    for (let i = 0; i < candles.length; i++) {
-      const candle = candles[i]!;
-      const volume24hUsd = rollingVolume24h(candles, i);
-      const snap = buildSnapshot(meta, candle, volume24hUsd);
-      yield* db.saveSnapshot(snap);
-      saved++;
-    }
-    log.info(`[${short}] saved ${saved} snapshots`);
+  }
+  if (skipped.length > 0) {
+    log.warn(`skipped ${skipped.length} pool(s): ${skipped.join(", ")}`);
   }
 
   const pools = yield* db.getSnapshotPools();
