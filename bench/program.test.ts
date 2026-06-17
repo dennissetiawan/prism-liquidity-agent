@@ -95,15 +95,30 @@ describe("estimatePositionValue", () => {
     expect(edgeValue).toBeLessThan(centerValue);
   });
 
-  it("reaches minimum value at far edge", () => {
+  it("applies only small IL when out of range (not a 50% haircut)", () => {
     const pos = makePos(4980, 5020, 1000);
-    const pool = makePool(5040);
-    expect(estimatePositionValue(pos, pool)).toBe(500);
+    const pool = makePool(5040); // 40 bins past center, fully out of range
+    const value = estimatePositionValue(pos, pool);
+    // Real CPMM IL at this drift is a fraction of a percent, so value stays
+    // near deposited — not the old linear heuristic's $500.
+    expect(value).toBeLessThan(1000);
+    expect(value).toBeGreaterThan(990);
   });
 
-  it("handles narrow ranges", () => {
+  it("handles narrow ranges — small drift stays near deposited", () => {
     const pos = makePos(4995, 5005, 1000);
     const pool = makePool(5005);
-    expect(estimatePositionValue(pos, pool)).toBe(500);
+    const value = estimatePositionValue(pos, pool);
+    expect(value).toBeGreaterThan(999);
+    expect(value).toBeLessThanOrEqual(1000);
+  });
+
+  it("credits accrued fees for a position held in range over time", () => {
+    const pos = makePos(4980, 5020, 1000);
+    const pool = makePool(5000);
+    pos.timestamp = pool.timestamp - 24 * 60 * 60 * 1000; // held one day in range
+    const value = estimatePositionValue(pos, pool);
+    // share = 1000/100000 = 0.01; daily fees = 300 × 0.01 = $3 → value > deposited
+    expect(value).toBeGreaterThan(1000);
   });
 });

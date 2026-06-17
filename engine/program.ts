@@ -39,15 +39,42 @@ import { randomUUID } from "crypto";
 let cycleInFlight = false;
 let skippedCycles = 0;
 
-// ─── Position value estimation (rough heuristic) ───────────────
-
+// ─── Position value estimation ─────────────────────────────────
+//
+// Models a DLMM position's value as: deposited × (1 + impermanent loss) +
+// accrued fees. The IL term uses the standard CPMM formula (the same one in
+// strategy-service.computeFeeIlRatio), driven by how far the active bin has
+// drifted from the position's center.
+//
+// This replaces a prior linear heuristic (`1 - driftPct*0.5`) that marked a
+// position down to 50% at the range edge — it hit −10% after drifting just
+// ~20% of the half-width (≈4 bins on a ±20 range) and ignored fees entirely.
+// Real IL at that drift is ~0.1–0.5%, so the heuristic overstated losses by
+// 20–50× and tripped the trailing stop on ordinary price noise, exiting
+// positions before any fee could accrue. The CPMM formula yields the correct
+// (small) IL, and crediting fees lets a position's value actually rise.
 export function estimatePositionValue(pos: PositionRecord, pool: PoolState): number {
   const centerBinId = (pos.lowerBinId + pos.upperBinId) / 2;
-  const maxDrift = Math.max(pos.upperBinId - centerBinId, 1);
-  const drift = Math.abs(pool.activeBinId - centerBinId);
-  const driftPct = Math.min(drift / maxDrift, 1);
-  const ilFactor = 1 - driftPct * 0.5;
-  return pos.depositedUsd * ilFactor;
+  const binsDrifted = Math.abs(pool.activeBinId - centerBinId);
+  const binStep = pool.binStep > 0 ? pool.binStep : 10;
+
+  // Impermanent loss vs HODL (ilFraction ≤ 0). At the range edge this is a
+  // fraction of a percent for typical bin steps, not the old 50%.
+  const priceRatio = Math.pow(1 + binStep / 10_000, binsDrifted);
+  const ilFraction = (2 * Math.sqrt(priceRatio)) / (1 + priceRatio) - 1;
+
+  // Fees accrue only while the active bin is within the position's range:
+  // the position's share of pool fees, prorated over the time it's been held.
+  const inRange = pool.activeBinId >= pos.lowerBinId && pool.activeBinId <= pos.upperBinId;
+  let accruedFeesUsd = 0;
+  if (inRange && pool.tvlUsd > 0 && pool.fees24hUsd > 0) {
+    const positionShare = Math.min(pos.depositedUsd / pool.tvlUsd, 1);
+    const msHeld = Math.max(0, pool.timestamp - pos.timestamp);
+    const daysHeld = msHeld / (24 * 60 * 60 * 1000);
+    accruedFeesUsd = pool.fees24hUsd * positionShare * daysHeld;
+  }
+
+  return pos.depositedUsd * (1 + ilFraction) + accruedFeesUsd;
 }
 
 export function reconcilePositions(
